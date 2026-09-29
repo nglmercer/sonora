@@ -113,7 +113,7 @@ pub use theme::{
 };
 pub use time::{clock, runtime, tabular};
 pub use toast::Toast;
-pub use tooltip::{Perch, Tooltip};
+pub use tooltip::{Perch, Tipped, Tooltip};
 pub use traffic_light_controls::TrafficLightControls;
 pub use vacancy::Vacancy;
 pub use view::Mode;

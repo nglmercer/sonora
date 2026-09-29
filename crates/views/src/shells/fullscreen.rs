@@ -112,7 +112,9 @@ impl FullscreenView {
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
         let settings = Sonora::global(cx).settings.clone();
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
-        let aside = cx.new(|cx| Aside::new(queue.clone(), playback.clone(), SideTab::Lyrics, cx));
+        let panel = settings.read(cx).fullscreen_tab();
+        let shown = panel.unwrap_or(SideTab::Lyrics);
+        let aside = cx.new(|cx| Aside::new(queue.clone(), playback.clone(), shown, cx));
         aside.update(cx, |aside, _| aside.strip());
         let me = cx.entity_id();
         let playlist_scrollbar = cx.new(|_| Scrollbar::inset().watching(me));
@@ -123,7 +125,7 @@ impl FullscreenView {
             cover,
             settings,
             aside,
-            panel: Some(SideTab::Lyrics),
+            panel,
             seek: ScrubberState::new("fullscreen-seek"),
             pending: None,
             over_seek: None,
@@ -165,6 +167,8 @@ impl FullscreenView {
 
     fn show(&mut self, panel: Option<SideTab>, cx: &mut Context<Self>) {
         self.panel = panel;
+        self.settings
+            .update(cx, |settings, cx| settings.set_fullscreen_tab(panel, cx));
         if let Some(tab) = panel {
             self.aside.update(cx, |aside, cx| aside.show(tab, cx));
         }

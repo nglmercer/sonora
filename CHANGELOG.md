@@ -15,6 +15,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clients that cannot send headers. It stays off until you enable it and only ever listens
   on your own device.
 
+## [0.42.0] - 2026-09-29
+
+### Added
+
+- Sonora speaks Czech. Pick it in Language settings.
+- Hovering a theme you cannot pick while the adaptive theme is on says why it is unavailable. The
+  note appears as soon as you point at the theme and moves with the cursor.
+- In guest mode, Show on startup greys out Songs, Albums, Artists and Playlists, which stay empty
+  without an account, and says why when you hover them.
+- Fullscreen opens on the tab you left it on, whether artwork, lyrics or queue, even after a
+  restart.
+- On Windows, Sonora shows up in Settings > Apps > Default apps, so you can make it the default
+  player for your audio files and for spotify: links.
+
+### Changed
+
+- The French translation is complete, so no screen falls back to English any more.
+- YouTube Music tracks start playing as soon as the first seconds arrive, instead of after the
+  whole song has downloaded, so a slow connection no longer means a long wait before each song.
+- Once the current track has finished downloading, Sonora starts downloading the next one in the
+  queue, so skipping ahead or moving on to the next song starts at once.
+
+### Fixed
+
+- The local Songs page is titled Songs during the first library scan, rather than Favorites.
+- Pressing play after a long pause no longer jumps to the next track a moment later. After a pause
+  of five minutes or more, Sonora reloads the track where you left it.
+- Settings and custom theme files saved on Windows with a byte order mark, as Notepad and
+  PowerShell can save them, now load instead of being reported as broken.
+- The Flatpak now offers the browser sign-in for YouTube, Apple Music and Deezer, and gets YouTube
+  its proof-of-origin token. The next update pulls in the GNOME runtime to make this work.
+- Pressing play on an album, playlist, artist or track no longer starts it over while it is loading,
+  buffering after a seek, or waiting to resume from your last session. It pauses or resumes
+  instead, and shows pause as soon as you press it, as the player bar already did.
+- Narrowing the window with both sidebars open no longer brings the left sidebar back once the right
+  one hides. The left one folds away first and stays folded until the window is wide again.
+- Tracks you added to the queue no longer appear twice in it when you turn shuffle on or off after
+  restarting Sonora.
+- Opening an audio file from your file manager plays it at once, even while the local library is
+  still scanning, instead of waiting for the scan to finish.
+
 ## [0.41.0] - 2026-09-28
 
 ### Added
@@ -1919,7 +1960,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Initial release: a native Spotify client with playback, an interactive queue, the saved library,
 search, album, playlist, artist and song pages, context menus and adaptive theming.
 
-[unreleased]: https://github.com/sonorahq/sonora/compare/v0.41.0...HEAD
+[unreleased]: https://github.com/sonorahq/sonora/compare/v0.42.0...HEAD
+[0.42.0]: https://github.com/sonorahq/sonora/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/sonorahq/sonora/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/sonorahq/sonora/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/sonorahq/sonora/compare/v0.38.0...v0.39.0

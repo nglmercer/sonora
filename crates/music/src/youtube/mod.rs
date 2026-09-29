@@ -5,6 +5,7 @@ mod genres;
 mod lyrics;
 mod playback;
 mod radio;
+mod segments;
 mod subscriptions;
 mod wire;
 

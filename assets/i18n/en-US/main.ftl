@@ -325,7 +325,6 @@ detail-play-playlist = Play playlist
 # play button
 play-pause = Pause
 play-resume = Resume
-play-loading = Loading…
 play-shuffle = Shuffle
 
 # artist page
@@ -500,6 +499,7 @@ settings-opacity = Opacity
 settings-opacity-detail = Adjust the app background opacity
 settings-opacity-value = { $percent }%
 settings-theme-folder = Open folder
+settings-theme-unavailable = This theme can be applied only when adaptive theme is disabled
 settings-adaptive = Adaptive theme
 settings-adaptive-detail = Tint the palette with the artwork of the playing album
 settings-ambient = Ambient background
@@ -535,6 +535,7 @@ settings-font-detail = Base text size, everything else scales with it
 settings-font-value = { $size } px
 settings-startup = Show on startup
 settings-startup-detail = The screen Sonora opens on launch
+settings-startup-no-guest = Unavailable in Guest mode
 settings-entries = Sidebar entries
 settings-entries-detail = The sections listed in the sidebar
 settings-entries-pick = Choose entries

@@ -155,12 +155,6 @@ pub trait MusicApi: Send + Sync {
     }
     async fn track(&self, track_id: &str) -> Result<Track>;
 
-    /// Reads an arbitrary file on disk as a track, for a provider whose tracks are files. Used
-    /// by file-association opens, which may point outside any scanned folder.
-    async fn track_from_path(&self, _path: &Path) -> Result<Track> {
-        anyhow::bail!("cannot open arbitrary files")
-    }
-
     /// Delete a track file from disk (only for local provider)
     async fn delete_track_file(&self, _track_id: &str) -> Result<()> {
         anyhow::bail!("this provider does not support file deletion")
@@ -377,6 +371,11 @@ pub enum PlaybackEvent {
         id: Option<String>,
         duration: Duration,
     },
+    /// The whole of the current track has arrived, so fetching the next one takes nothing from
+    /// it. Engines that cannot tell never send this.
+    Downloaded {
+        id: Option<String>,
+    },
     Ended {
         id: Option<String>,
     },
@@ -402,6 +401,7 @@ impl PlaybackEvent {
             | Self::Position { id, .. }
             | Self::Seeked { id, .. }
             | Self::Length { id, .. }
+            | Self::Downloaded { id }
             | Self::Ended { id, .. }
             | Self::Unavailable { id, .. }
             | Self::Throttled { id } => id.as_deref(),
@@ -633,6 +633,17 @@ pub trait MusicProvider: Send + Sync {
     /// everything again. Only a provider that scans files has anything to forget, and only a
     /// rescan the user asked for should ask it to.
     fn forget_scan(&self) {}
+    /// A factory for the provider's playback engine that can work without sign-in and scan,
+    /// so playback can start before the library has loaded. Only for a provider whose tracks
+    /// are files.
+    fn playback_factory(&self) -> Option<Arc<dyn PlaybackFactory>> {
+        None
+    }
+    /// Reads an arbitrary file on disk as a track, for a provider whose tracks are files. Used
+    /// by file-association opens, which may point outside any scanned folder.
+    fn track_from_path(&self, _path: &Path) -> Option<Track> {
+        None
+    }
     fn sign_in_options(&self) -> Vec<SignIn>;
     fn stored(&self) -> bool;
     /// Whether what is stored is an anonymous session rather than an account, so a caller

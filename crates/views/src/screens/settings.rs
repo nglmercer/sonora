@@ -1111,17 +1111,21 @@ impl SettingsView {
         let small = theme.text(Text::Small);
         let chosen = Screen::from_id(self.settings.read(cx).startup()).unwrap_or(Screen::Home);
         let current = i18n::lookup(chosen.key(), None);
+        let guest = !self.session.read(cx).authenticated();
 
         let picker = Picker::new(STARTUP, &self.popovers, current)
             .width(Picker::NARROW)
             .items(Screen::ALL.map(|screen| {
-                MenuItem::new(screen.id(), i18n::lookup(screen.key(), None))
-                    .selected(screen == chosen)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                let item = MenuItem::new(screen.id(), i18n::lookup(screen.key(), None))
+                    .selected(screen == chosen);
+                match guest && screen.needs_account() {
+                    true => item.disabled().tooltip("settings-startup-no-guest"),
+                    false => item.on_click(cx.listener(move |this, _, _, cx| {
                         this.settings
                             .update(cx, |settings, cx| settings.set_startup(screen.id(), cx));
                         cx.notify();
-                    }))
+                    })),
+                }
             }));
 
         self.row(
@@ -1758,7 +1762,7 @@ impl SettingsView {
                 match adaptive
                     && !matches!(kind, ThemeKind::System | ThemeKind::Dark | ThemeKind::Light)
                 {
-                    true => item.disabled(),
+                    true => item.disabled().tooltip("settings-theme-unavailable"),
                     false => item.on_click(cx.listener(move |this, _, _, cx| {
                         let overrides = this.settings.update(cx, |settings, cx| {
                             settings.set_theme(kind.id(), cx);
@@ -1777,7 +1781,7 @@ impl SettingsView {
         items.extend(custom.into_iter().map(|(id, name)| {
             let item = MenuItem::new(format!("custom-theme:{id}"), name).selected(selected == id);
             match adaptive {
-                true => item.disabled(),
+                true => item.disabled().tooltip("settings-theme-unavailable"),
                 false => item.on_click(cx.listener(move |this, _, _, cx| {
                     let overrides = this.settings.update(cx, |settings, cx| {
                         settings.set_theme(id.clone(), cx);

@@ -3,7 +3,7 @@ use gpui::{App, ElementId, Entity, FontWeight, SharedString, div};
 use i18n::t;
 use music::{Album, ArtistRef, Genre, GenreItem, Playlist, ReleaseType, SavedArtist, Track};
 use router::{Destination, navigate};
-use state::{Origin, Playback, PlaybackState};
+use state::{Origin, Playback};
 use ui::{ActiveTheme as _, Card, InlineLinks, Pinnable, Text, Theme};
 
 use crate::shared::cells;
@@ -23,10 +23,7 @@ pub(crate) fn album_card(
 ) -> Card {
     let cover = album.cover_large.clone().or_else(|| album.cover.clone());
     let origin = Origin::album(album.id.clone()).named(album.name.clone());
-    let playing = matches!(
-        playback.read(cx).playing_from(&origin),
-        Some(PlaybackState::Playing)
-    );
+    let playing = playback.read(cx).playing_from(&origin) == Some(true);
     let pin = album.pin();
     let opened = SharedString::from(album.id.clone());
     let toggled = playback.clone();
@@ -62,10 +59,7 @@ pub(crate) fn playlist_card(
     cx: &App,
 ) -> Card {
     let origin = Origin::playlist(playlist.id.clone()).named(playlist.name.clone());
-    let playing = matches!(
-        playback.read(cx).playing_from(&origin),
-        Some(PlaybackState::Playing)
-    );
+    let playing = playback.read(cx).playing_from(&origin) == Some(true);
     let pin = playlist.pin();
     let opened = SharedString::from(playlist.id.clone());
     let toggled = playback.clone();
@@ -114,16 +108,13 @@ pub(crate) fn track_card(
         .when_some(track.pin(), Pinnable::pin)
 }
 
-/// Whether the track is the one in the player, and whether that one is playing.
+/// Whether the track is the one in the player, and whether its play button shows pause.
 pub(crate) fn track_status(track: &Track, playback: &Entity<Playback>, cx: &App) -> (bool, bool) {
     let playback = playback.read(cx);
     let current = track.id.is_some()
         && playback.track().and_then(|playing| playing.id.as_deref()) == track.id.as_deref();
 
-    (
-        current,
-        current && playback.state() == &PlaybackState::Playing,
-    )
+    (current, current && playback.control() == Some(true))
 }
 
 /// The artists of a track as the small muted links under its name.
@@ -388,10 +379,7 @@ pub(crate) fn artist_card(
     cx: &App,
 ) -> Card {
     let origin = Origin::artist(artist.id.clone()).named(artist.name.clone());
-    let playing = matches!(
-        playback.read(cx).playing_from(&origin),
-        Some(PlaybackState::Playing)
-    );
+    let playing = playback.read(cx).playing_from(&origin) == Some(true);
     let pin = artist.pin();
     let opened = SharedString::from(artist.id.clone());
     let toggled = playback.clone();

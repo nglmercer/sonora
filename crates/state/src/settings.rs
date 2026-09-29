@@ -239,6 +239,16 @@ fn system_font() -> String {
     SYSTEM_FONT.to_owned()
 }
 
+/// The loopback port the REST control plugin listens on unless settings say otherwise.
+fn default_rest_port() -> u16 {
+    47630
+}
+
+/// The loopback port the WebSocket control plugin listens on unless settings say otherwise.
+fn default_ws_port() -> u16 {
+    47631
+}
+
 /// How long a save waits after the last change, so a slider drag lands as one write.
 const SAVE_DELAY: Duration = Duration::from_millis(300);
 const SAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -315,6 +325,14 @@ struct Values {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     scrobbling: BTreeMap<String, Account>,
     appearance: Appearance,
+    /// Whether the REST control plugin listens. Off until the user opts in.
+    rest_api: bool,
+    /// Whether the WebSocket control plugin listens. Off until the user opts in.
+    ws_api: bool,
+    #[serde(default = "default_rest_port")]
+    rest_port: u16,
+    #[serde(default = "default_ws_port")]
+    ws_port: u16,
 }
 
 /// The `appearance` block of `settings.json`. Fixed choices are stored by id, removed variant
@@ -464,6 +482,10 @@ impl Default for Values {
             hidden_nav: Vec::new(),
             scrobbling: BTreeMap::new(),
             appearance: Appearance::default(),
+            rest_api: false,
+            ws_api: false,
+            rest_port: default_rest_port(),
+            ws_port: default_ws_port(),
         }
     }
 }
@@ -640,6 +662,12 @@ pub struct Reloaded;
 impl EventEmitter<Reloaded> for AppSettings {}
 
 impl AppSettings {
+    /// Loads from explicit paths instead of the standard ones, so tests never touch the
+    /// real config.
+    pub fn load_at(path: PathBuf, database: Database) -> Self {
+        Self::load_from(path, StateStore::new(database))
+    }
+
     /// Loads from the standard config and data paths.
     pub fn load(database: Database) -> Self {
         Self::load_from(settings_path(), StateStore::new(database))
@@ -840,6 +868,26 @@ impl AppSettings {
     /// Whether music keeps the system awake and, in fullscreen, the display.
     pub fn stay_awake(&self) -> bool {
         self.values.stay_awake
+    }
+
+    /// Whether the REST control plugin listens on loopback.
+    pub fn rest_api(&self) -> bool {
+        self.values.rest_api
+    }
+
+    /// Whether the WebSocket control plugin listens on loopback.
+    pub fn ws_api(&self) -> bool {
+        self.values.ws_api
+    }
+
+    /// The loopback port the REST control plugin listens on. Zero asks the OS for one.
+    pub fn rest_port(&self) -> u16 {
+        self.values.rest_port
+    }
+
+    /// The loopback port the WebSocket control plugin listens on. Zero asks the OS for one.
+    pub fn ws_port(&self) -> u16 {
+        self.values.ws_port
     }
 
     /// Every linked scrobbling account, keyed by its service slug.
@@ -1240,6 +1288,26 @@ impl AppSettings {
 
     pub fn set_stay_awake(&mut self, stay_awake: bool, cx: &mut Context<Self>) {
         self.values.stay_awake = stay_awake;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_rest_api(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.values.rest_api = enabled;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_ws_api(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.values.ws_api = enabled;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_rest_port(&mut self, port: u16, cx: &mut Context<Self>) {
+        self.values.rest_port = port;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_ws_port(&mut self, port: u16, cx: &mut Context<Self>) {
+        self.values.ws_port = port;
         self.schedule_save(cx);
     }
 
@@ -2445,6 +2513,16 @@ mod tests {
         );
         assert!(values.romanization_scripts.contains(WritingSystem::Chinese));
         assert!(!values.romanization_scripts.contains(WritingSystem::Other));
+    }
+
+    #[test]
+    fn remote_apis_stay_off_with_documented_ports() {
+        let values: Values = serde_json::from_str("{}").expect("empty settings use defaults");
+
+        assert!(!values.rest_api);
+        assert!(!values.ws_api);
+        assert_eq!(values.rest_port, 47630);
+        assert_eq!(values.ws_port, 47631);
     }
 
     #[test]

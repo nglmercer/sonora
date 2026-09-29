@@ -10,9 +10,11 @@ use crate::shared::local;
 use crate::shared::popups::{AccountPicker, CookiePrompt, SearchPopup, matches_query};
 use crate::shared::text;
 use crate::shared::veil::{Edge, veil};
+use gpui::Focusable as _;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, FocusHandle, FontWeight, MouseButton,
-    MouseUpEvent, Pixels, Render, SharedString, Task, Window, div, px, relative,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, FontWeight,
+    MouseButton, MouseUpEvent, Pixels, Render, SharedString, Subscription, Task, Window, div, px,
+    relative,
 };
 use gpui::{ScrollHandle, prelude::*, svg};
 use i18n::{Language, t};
@@ -23,7 +25,8 @@ use music::{AccountChoice, SignIn, SignInPrompt, WritingSystem};
 use router::{Destination, NavEntry, Screen, SettingsTab, navigate};
 use state::{
     AppSettings, CdmState, DiscordName, Drm, Failure, FullscreenControlsAutohide, Io, Playback,
-    SYSTEM_FONT, Scan, ScrobbleState, Scrobbling, Session, SessionState, Sleep, Sonora,
+    PluginStatus, Plugins, SYSTEM_FONT, Scan, ScrobbleState, Scrobbling, Session, SessionState,
+    Sleep, Sonora,
 };
 use ui::{ActiveTheme as _, Deck, LEADING, Scrollbar, Scroller, eyebrow, snapped};
 use ui::{
@@ -34,6 +37,8 @@ use ui::{
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// How wide a remote-control port field is: five digits with room to breathe.
+const PORT_FIELD: Pixels = px(88.);
 /// How wide the settings column, the search field and the category bar grow at most.
 const WIDTH: Pixels = px(640.);
 /// How much a query found in a setting's title counts over one found in its detail.
@@ -181,6 +186,9 @@ enum Slot {
     DiscordAnonymous,
     DiscordButtons,
     Scrobble(usize),
+    RestApi,
+    WsApi,
+    RemoteToken,
     Version,
     Updates,
     Log,
@@ -289,6 +297,7 @@ pub struct SettingsView {
     playback: Entity<Playback>,
     drm: Entity<Drm>,
     settings: Entity<AppSettings>,
+    plugins: Entity<Plugins>,
     tab: SettingsTab,
     search: Entity<Input>,
     /// The search field's text, trimmed. Empty means the page shows one category.
@@ -318,6 +327,11 @@ pub struct SettingsView {
     scrobbling: Entity<Scrobbling>,
     scrobble_first: Entity<Input>,
     scrobble_second: Entity<Input>,
+    port_rest: Entity<Input>,
+    port_ws: Entity<Input>,
+    /// The focus-loss subscriptions that flush the port fields. Made in the first render,
+    /// which is the first place with the window `on_blur` needs.
+    port_blur: Option<[Subscription; 2]>,
     /// The service whose link dialog is open, by slug.
     scrobble_prompt: Option<&'static str>,
     /// The provider whose sign-in choice is up, by slug and name.
@@ -352,10 +366,12 @@ impl SettingsView {
         let settings = Sonora::global(cx).settings.clone();
         let scrobbling = Sonora::global(cx).scrobbling.clone();
         let drm = Sonora::global(cx).drm.clone();
+        let plugins = Plugins::entity(cx);
         cx.observe(&drm, |_, _, cx| cx.notify()).detach();
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         cx.observe(&scrobbling, |_, _, cx| cx.notify()).detach();
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
+        cx.observe(&plugins, |_, _, cx| cx.notify()).detach();
         cx.observe(&playback, |_, _, cx| cx.notify()).detach();
         cx.observe(&Scan::global(cx), |_, _, cx| cx.notify())
             .detach();
@@ -393,11 +409,15 @@ impl SettingsView {
         })
         .detach();
 
+        let rest_port = settings.read(cx).rest_port().to_string();
+        let ws_port = settings.read(cx).ws_port().to_string();
+
         Self {
             session,
             playback,
             drm,
             settings,
+            plugins,
             tab: SettingsTab::General,
             search,
             query: String::new(),
@@ -426,6 +446,17 @@ impl SettingsView {
             scrobbling,
             scrobble_first: cx.new(|cx| Input::new("settings-scrobble-key", cx)),
             scrobble_second: cx.new(|cx| Input::new("settings-scrobble-secret", cx)),
+            port_rest: cx.new(|cx| {
+                let mut input = Input::new("", cx).compact();
+                input.set_text(rest_port, cx);
+                input
+            }),
+            port_ws: cx.new(|cx| {
+                let mut input = Input::new("", cx).compact();
+                input.set_text(ws_port, cx);
+                input
+            }),
+            port_blur: None,
             scrobble_prompt: None,
             languages,
             typefaces,
@@ -640,6 +671,12 @@ impl SettingsView {
                 .into_iter()
                 .chain([Slot::Title("settings-group-scrobbling")])
                 .chain(self.scrobble_slots(cx))
+                .chain([
+                    Slot::Title("settings-group-remote"),
+                    Slot::RestApi,
+                    Slot::WsApi,
+                    Slot::RemoteToken,
+                ])
                 .collect(),
             SettingsTab::About => vec![
                 Slot::Title("settings-tab-general"),
@@ -829,6 +866,12 @@ impl SettingsView {
                 };
                 (i18n::lookup(&format!("settings-{service}"), None), detail)
             }
+            Slot::RestApi => (t!("settings-rest-api"), t!("settings-rest-api-detail")),
+            Slot::WsApi => (t!("settings-ws-api"), t!("settings-ws-api-detail")),
+            Slot::RemoteToken => (
+                t!("settings-remote-token"),
+                t!("settings-remote-token-detail"),
+            ),
             Slot::Version => (t!("settings-version"), t!("settings-version-detail")),
             Slot::Updates => (
                 t!("settings-check-updates"),
@@ -989,6 +1032,9 @@ impl SettingsView {
                 true => self.scrobble_row(index, cx).element,
                 false => div().into_any_element(),
             },
+            Slot::RestApi => self.rest_api_row(cx).element,
+            Slot::WsApi => self.ws_api_row(cx).element,
+            Slot::RemoteToken => self.remote_token_row(cx).element,
             Slot::Version => self.version_row(cx).element,
             Slot::Updates => self.updates_row(cx).element,
             Slot::Log => self.log_row(cx).element,
@@ -3940,6 +3986,202 @@ impl SettingsView {
             }))
     }
 
+    /// The REST switch with its port field: the detail names where it listens, or why not.
+    fn rest_api_row(&self, cx: &mut Context<Self>) -> Setting {
+        let settings = self.settings.read(cx);
+        self.remote_row(
+            "rest",
+            t!("settings-rest-api"),
+            self.plugins.read(cx).status("rest"),
+            "http",
+            settings.rest_api(),
+            settings.rest_port(),
+            self.port_rest.clone(),
+            AppSettings::set_rest_api,
+            cx,
+        )
+    }
+
+    /// The WebSocket switch with its port field: the detail names where it listens, or why
+    /// not.
+    fn ws_api_row(&self, cx: &mut Context<Self>) -> Setting {
+        let settings = self.settings.read(cx);
+        self.remote_row(
+            "ws",
+            t!("settings-ws-api"),
+            self.plugins.read(cx).status("ws"),
+            "ws",
+            settings.ws_api(),
+            settings.ws_port(),
+            self.port_ws.clone(),
+            AppSettings::set_ws_api,
+            cx,
+        )
+    }
+
+    /// One control transport: a port field and an enable switch, with the detail naming
+    /// where it listens, what it would listen on, or why the bind failed.
+    #[allow(clippy::too_many_arguments, reason = "one row serves both transports")]
+    fn remote_row(
+        &self,
+        id: &'static str,
+        title: SharedString,
+        status: Option<PluginStatus>,
+        scheme: &'static str,
+        on: bool,
+        port: u16,
+        input: Entity<Input>,
+        set_on: fn(&mut AppSettings, bool, &mut Context<AppSettings>),
+        cx: &mut Context<Self>,
+    ) -> Setting {
+        let theme = *cx.theme();
+        let detail = match status {
+            Some(PluginStatus::Running { addr }) => {
+                let url = format!("{scheme}://{addr}");
+                t!("settings-remote-listening", url = url.as_str())
+            }
+            Some(PluginStatus::Failed { reason }) => {
+                t!("settings-remote-failed", reason = reason.as_str())
+            }
+            Some(PluginStatus::Stopped) | None => {
+                let url = format!("{scheme}://127.0.0.1:{port}");
+                t!("settings-remote-off", url = url.as_str())
+            }
+        };
+        let action = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .child(div().w(PORT_FIELD).child(input))
+            .child(
+                Switch::new(id, on).on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings
+                        .update(cx, |settings, cx| set_on(settings, !on, cx));
+                })),
+            )
+            .into_any_element();
+
+        self.row(
+            title,
+            detail,
+            theme.muted_foreground,
+            theme.text(Text::Small),
+            action,
+        )
+    }
+
+    /// The control token: the secret itself with copy and rotate buttons, and the warning
+    /// that anyone holding it drives playback from this device.
+    fn remote_token_row(&self, cx: &mut Context<Self>) -> Setting {
+        let theme = *cx.theme();
+        let muted = theme.muted_foreground;
+        let small = theme.text(Text::Small);
+        let token = self.plugins.read(cx).token();
+        let title = t!("settings-remote-token");
+        let detail = match token.clone() {
+            Some(token) => SharedString::from(token),
+            None => t!("settings-remote-token-none"),
+        };
+
+        let action = div().flex().flex_none().items_center().gap_2().when_some(
+            token.clone(),
+            |row, token| {
+                row.child(
+                    Button::new("remote-token-copy")
+                        .label(t!("settings-remote-token-copy"))
+                        .small()
+                        .outline()
+                        .icon("icons/copy.svg")
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(token.clone()));
+                        }),
+                )
+                .child(
+                    Button::new("remote-token-rotate")
+                        .label(t!("settings-remote-token-rotate"))
+                        .small()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.plugins.update(cx, |plugins, cx| {
+                                plugins.rotate_token(cx);
+                            });
+                        })),
+                )
+            },
+        );
+
+        let element = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .py_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .h(widevine_head(&theme))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .line_height(relative(LEADING))
+                            .child(title.clone()),
+                    )
+                    .child(action),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .line_height(relative(LEADING))
+                    .text_color(muted)
+                    .text_size(small)
+                    .child(detail.clone()),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .line_height(relative(LEADING))
+                    .text_color(muted)
+                    .text_size(small)
+                    .child(t!("settings-remote-warning")),
+            )
+            .into_any_element();
+
+        Setting {
+            title,
+            detail,
+            element,
+        }
+    }
+
+    /// Applies a port field to settings once it loses focus. A valid new port rebinds the
+    /// listener; anything else snaps the field back to the running port.
+    fn flush_port(&mut self, rest: bool, cx: &mut Context<Self>) {
+        let input = match rest {
+            true => self.port_rest.clone(),
+            false => self.port_ws.clone(),
+        };
+        let current = match rest {
+            true => self.settings.read(cx).rest_port(),
+            false => self.settings.read(cx).ws_port(),
+        };
+        match valid_port(input.read(cx).text()) {
+            Some(port) if port != current => self.settings.update(cx, |settings, cx| match rest {
+                true => settings.set_rest_port(port, cx),
+                false => settings.set_ws_port(port, cx),
+            }),
+            Some(_) => {}
+            None => input.update(cx, |input, cx| input.set_text(current.to_string(), cx)),
+        }
+    }
+
     fn version_row(&self, cx: &mut Context<Self>) -> Setting {
         let theme = *cx.theme();
 
@@ -4349,6 +4591,16 @@ fn open_path(path: &Path) -> std::io::Result<()> {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The port fields flush on focus loss, so typing never rebinds a listener
+        // mid-number. The subscriptions live with the view once made.
+        if self.port_blur.is_none() {
+            let rest = self.port_rest.read(cx).focus_handle(cx);
+            let ws = self.port_ws.read(cx).focus_handle(cx);
+            self.port_blur = Some([
+                cx.on_blur(&rest, window, |this, _, cx| this.flush_port(true, cx)),
+                cx.on_blur(&ws, window, |this, _, cx| this.flush_port(false, cx)),
+            ]);
+        }
         let searching = self.searching();
         // a search can list the typeface row from any category
         let in_appearance = self.tab == SettingsTab::Appearance || searching;
@@ -4709,5 +4961,33 @@ fn hertz(frequency: f32) -> SharedString {
             khz = (frequency / 1_000.).round() as i64
         ),
         false => t!("settings-equalizer-hertz", hz = frequency.round() as i64),
+    }
+}
+
+/// Parses a remote-control port field: digits only, 1 to 65535. Anything else keeps the
+/// current port.
+fn valid_port(text: &str) -> Option<u16> {
+    text.parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_port;
+
+    #[test]
+    fn port_fields_take_1_to_65535() {
+        assert_eq!(valid_port("1"), Some(1));
+        assert_eq!(valid_port("47630"), Some(47630));
+        assert_eq!(valid_port("65535"), Some(65535));
+    }
+
+    #[test]
+    fn port_fields_reject_the_rest() {
+        assert_eq!(valid_port("0"), None);
+        assert_eq!(valid_port(""), None);
+        assert_eq!(valid_port("http"), None);
+        assert_eq!(valid_port("65536"), None);
+        assert_eq!(valid_port("47a30"), None);
+        assert_eq!(valid_port(" 80"), None);
     }
 }

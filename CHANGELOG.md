@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Local apps can now drive Sonora over REST and WebSocket control APIs. Turn them on in
+  Settings > Integrations > Remote control, where each transport shows its address and a token
+  your app sends with every call. Both stay off until you enable them and only ever listen on
+  your own device.
+
 ## [0.41.0] - 2026-09-28
 
 ### Added

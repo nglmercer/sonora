@@ -1,5 +1,4 @@
-pub mod rest;
-pub mod websocket;
+pub mod remote;
 
 use std::sync::Arc;
 
@@ -10,17 +9,11 @@ use state::{AppSettings, Registration};
 pub fn attach(cx: &mut App) {
     state::attach_plugins(
         cx,
-        vec![
-            Registration {
-                plugin: Arc::new(rest::RestPlugin),
-                enabled: AppSettings::rest_api,
-                port: AppSettings::rest_port,
-            },
-            Registration {
-                plugin: Arc::new(websocket::WsPlugin),
-                enabled: AppSettings::ws_api,
-                port: AppSettings::ws_port,
-            },
-        ],
+        vec![Registration {
+            plugin: Arc::new(remote::RemotePlugin),
+            enabled: AppSettings::remote_api,
+            port: AppSettings::remote_port,
+            auth_required: AppSettings::remote_auth,
+        }],
     );
 }

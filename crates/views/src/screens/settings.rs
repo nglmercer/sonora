@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -186,8 +187,9 @@ enum Slot {
     DiscordAnonymous,
     DiscordButtons,
     Scrobble(usize),
-    RestApi,
-    WsApi,
+    Remote,
+    RemotePort,
+    RemoteAuth,
     RemoteToken,
     Version,
     Updates,
@@ -327,11 +329,10 @@ pub struct SettingsView {
     scrobbling: Entity<Scrobbling>,
     scrobble_first: Entity<Input>,
     scrobble_second: Entity<Input>,
-    port_rest: Entity<Input>,
-    port_ws: Entity<Input>,
-    /// The focus-loss subscriptions that flush the port fields. Made in the first render,
+    port_remote: Entity<Input>,
+    /// The focus-loss subscription that flushes the port field. Made in the first render,
     /// which is the first place with the window `on_blur` needs.
-    port_blur: Option<[Subscription; 2]>,
+    port_blur: Option<Subscription>,
     /// The service whose link dialog is open, by slug.
     scrobble_prompt: Option<&'static str>,
     /// The provider whose sign-in choice is up, by slug and name.
@@ -409,8 +410,7 @@ impl SettingsView {
         })
         .detach();
 
-        let rest_port = settings.read(cx).rest_port().to_string();
-        let ws_port = settings.read(cx).ws_port().to_string();
+        let remote_port = settings.read(cx).remote_port().to_string();
 
         Self {
             session,
@@ -446,14 +446,9 @@ impl SettingsView {
             scrobbling,
             scrobble_first: cx.new(|cx| Input::new("settings-scrobble-key", cx)),
             scrobble_second: cx.new(|cx| Input::new("settings-scrobble-secret", cx)),
-            port_rest: cx.new(|cx| {
+            port_remote: cx.new(|cx| {
                 let mut input = Input::new("", cx).compact();
-                input.set_text(rest_port, cx);
-                input
-            }),
-            port_ws: cx.new(|cx| {
-                let mut input = Input::new("", cx).compact();
-                input.set_text(ws_port, cx);
+                input.set_text(remote_port, cx);
                 input
             }),
             port_blur: None,
@@ -671,12 +666,7 @@ impl SettingsView {
                 .into_iter()
                 .chain([Slot::Title("settings-group-scrobbling")])
                 .chain(self.scrobble_slots(cx))
-                .chain([
-                    Slot::Title("settings-group-remote"),
-                    Slot::RestApi,
-                    Slot::WsApi,
-                    Slot::RemoteToken,
-                ])
+                .chain(self.remote_slots(cx))
                 .collect(),
             SettingsTab::About => vec![
                 Slot::Title("settings-tab-general"),
@@ -866,8 +856,15 @@ impl SettingsView {
                 };
                 (i18n::lookup(&format!("settings-{service}"), None), detail)
             }
-            Slot::RestApi => (t!("settings-rest-api"), t!("settings-rest-api-detail")),
-            Slot::WsApi => (t!("settings-ws-api"), t!("settings-ws-api-detail")),
+            Slot::Remote => (t!("settings-remote"), t!("settings-remote-detail")),
+            Slot::RemotePort => (
+                t!("settings-remote-port"),
+                t!("settings-remote-port-detail"),
+            ),
+            Slot::RemoteAuth => (
+                t!("settings-remote-auth"),
+                t!("settings-remote-auth-detail"),
+            ),
             Slot::RemoteToken => (
                 t!("settings-remote-token"),
                 t!("settings-remote-token-detail"),
@@ -904,6 +901,7 @@ impl SettingsView {
                 window,
             ),
             Slot::Widevine => snapped(self.widevine_height(&theme, window, cx), window),
+            Slot::RemoteToken => snapped(self.remote_token_height(&theme, window, cx), window),
             _ => snapped(standard_height(&theme), window),
         }
     }
@@ -934,6 +932,30 @@ impl SettingsView {
         );
         SECTION_GAP
             + widevine_head(theme)
+            + ROW_GAP
+            + line(theme, Text::Small) * lines as f32
+            + SECTION_GAP
+    }
+
+    /// The token row: its title and buttons over the one-line token and every line its
+    /// warning wraps to. Summed from the same parts the element is built of, so the deck
+    /// never clips the warning.
+    fn remote_token_height(&self, theme: &Theme, window: &Window, cx: &App) -> Pixels {
+        let width = self.column.unwrap_or(WIDTH);
+        let key = match self.settings.read(cx).remote_auth() {
+            true => "settings-remote-warning",
+            false => "settings-remote-warning-open",
+        };
+        let lines = wrapped_lines(
+            i18n::lookup(key, None),
+            theme.text(Text::Small),
+            width,
+            window,
+        );
+        SECTION_GAP
+            + widevine_head(theme)
+            + ROW_GAP
+            + line(theme, Text::Small)
             + ROW_GAP
             + line(theme, Text::Small) * lines as f32
             + SECTION_GAP
@@ -1032,8 +1054,9 @@ impl SettingsView {
                 true => self.scrobble_row(index, cx).element,
                 false => div().into_any_element(),
             },
-            Slot::RestApi => self.rest_api_row(cx).element,
-            Slot::WsApi => self.ws_api_row(cx).element,
+            Slot::Remote => self.remote_row(cx).element,
+            Slot::RemotePort => self.remote_port_row(cx).element,
+            Slot::RemoteAuth => self.remote_auth_row(cx).element,
             Slot::RemoteToken => self.remote_token_row(cx).element,
             Slot::Version => self.version_row(cx).element,
             Slot::Updates => self.updates_row(cx).element,
@@ -3986,88 +4009,92 @@ impl SettingsView {
             }))
     }
 
-    /// The REST switch with its port field: the detail names where it listens, or why not.
-    fn rest_api_row(&self, cx: &mut Context<Self>) -> Setting {
-        let settings = self.settings.read(cx);
-        self.remote_row(
-            "rest",
-            t!("settings-rest-api"),
-            self.plugins.read(cx).status("rest"),
-            "http",
-            settings.rest_api(),
-            settings.rest_port(),
-            self.port_rest.clone(),
-            AppSettings::set_rest_api,
-            cx,
-        )
+    /// The remote control section: the master switch on its own while off, with the port,
+    /// auth and token rows unfolding beneath it once on.
+    fn remote_slots(&self, cx: &App) -> Vec<Slot> {
+        let mut slots = vec![Slot::Title("settings-group-remote"), Slot::Remote];
+        if self.settings.read(cx).remote_api() {
+            slots.push(Slot::RemotePort);
+            slots.push(Slot::RemoteAuth);
+            slots.push(Slot::RemoteToken);
+        }
+        slots
     }
 
-    /// The WebSocket switch with its port field: the detail names where it listens, or why
-    /// not.
-    fn ws_api_row(&self, cx: &mut Context<Self>) -> Setting {
-        let settings = self.settings.read(cx);
-        self.remote_row(
-            "ws",
-            t!("settings-ws-api"),
-            self.plugins.read(cx).status("ws"),
-            "ws",
-            settings.ws_api(),
-            settings.ws_port(),
-            self.port_ws.clone(),
-            AppSettings::set_ws_api,
-            cx,
-        )
-    }
-
-    /// One control transport: a port field and an enable switch, with the detail naming
-    /// where it listens, what it would listen on, or why the bind failed.
-    #[allow(clippy::too_many_arguments, reason = "one row serves both transports")]
-    fn remote_row(
-        &self,
-        id: &'static str,
-        title: SharedString,
-        status: Option<PluginStatus>,
-        scheme: &'static str,
-        on: bool,
-        port: u16,
-        input: Entity<Input>,
-        set_on: fn(&mut AppSettings, bool, &mut Context<AppSettings>),
-        cx: &mut Context<Self>,
-    ) -> Setting {
+    /// The remote control switch: the detail names where the server listens, what it would
+    /// listen on, or why the bind failed.
+    fn remote_row(&self, cx: &mut Context<Self>) -> Setting {
         let theme = *cx.theme();
-        let detail = match status {
+        let settings = self.settings.read(cx);
+        let on = settings.remote_api();
+        let auth = settings.remote_auth();
+        let detail = match self.plugins.read(cx).status("remote") {
             Some(PluginStatus::Running { addr }) => {
-                let url = format!("{scheme}://{addr}");
-                t!("settings-remote-listening", url = url.as_str())
+                let url = remote_urls(&addr);
+                match auth {
+                    true => t!("settings-remote-listening", url = url.as_str()),
+                    false => t!("settings-remote-listening-open", url = url.as_str()),
+                }
             }
             Some(PluginStatus::Failed { reason }) => {
                 t!("settings-remote-failed", reason = reason.as_str())
             }
             Some(PluginStatus::Stopped) | None => {
-                let url = format!("{scheme}://127.0.0.1:{port}");
+                let url = remote_urls(&SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    settings.remote_port(),
+                ));
                 t!("settings-remote-off", url = url.as_str())
             }
         };
-        let action = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_2()
-            .child(div().w(PORT_FIELD).child(input))
-            .child(
-                Switch::new(id, on).on_click(cx.listener(move |this, _, _, cx| {
-                    this.settings
-                        .update(cx, |settings, cx| set_on(settings, !on, cx));
-                })),
-            )
-            .into_any_element();
 
         self.row(
-            title,
+            t!("settings-remote"),
             detail,
             theme.muted_foreground,
             theme.text(Text::Small),
-            action,
+            Switch::new("remote", on)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings
+                        .update(cx, |settings, cx| settings.set_remote_api(!on, cx));
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The remote control port: one loopback port for HTTP and WebSocket alike.
+    fn remote_port_row(&self, cx: &mut Context<Self>) -> Setting {
+        let theme = *cx.theme();
+
+        self.row(
+            t!("settings-remote-port"),
+            t!("settings-remote-port-detail"),
+            theme.muted_foreground,
+            theme.text(Text::Small),
+            div()
+                .w(PORT_FIELD)
+                .child(self.port_remote.clone())
+                .into_any_element(),
+        )
+    }
+
+    /// The remote control token switch: off leaves the loopback listener open to any local
+    /// client, and the token row below says so.
+    fn remote_auth_row(&self, cx: &mut Context<Self>) -> Setting {
+        let theme = *cx.theme();
+        let on = self.settings.read(cx).remote_auth();
+
+        self.row(
+            t!("settings-remote-auth"),
+            t!("settings-remote-auth-detail"),
+            theme.muted_foreground,
+            theme.text(Text::Small),
+            Switch::new("remote-auth", on)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings
+                        .update(cx, |settings, cx| settings.set_remote_auth(!on, cx));
+                }))
+                .into_any_element(),
         )
     }
 
@@ -4082,6 +4109,10 @@ impl SettingsView {
         let detail = match token.clone() {
             Some(token) => SharedString::from(token),
             None => t!("settings-remote-token-none"),
+        };
+        let warning = match self.settings.read(cx).remote_auth() {
+            true => t!("settings-remote-warning"),
+            false => t!("settings-remote-warning-open"),
         };
 
         let action = div().flex().flex_none().items_center().gap_2().when_some(
@@ -4150,7 +4181,7 @@ impl SettingsView {
                     .line_height(relative(LEADING))
                     .text_color(muted)
                     .text_size(small)
-                    .child(t!("settings-remote-warning")),
+                    .child(warning),
             )
             .into_any_element();
 
@@ -4161,22 +4192,15 @@ impl SettingsView {
         }
     }
 
-    /// Applies a port field to settings once it loses focus. A valid new port rebinds the
-    /// listener; anything else snaps the field back to the running port.
-    fn flush_port(&mut self, rest: bool, cx: &mut Context<Self>) {
-        let input = match rest {
-            true => self.port_rest.clone(),
-            false => self.port_ws.clone(),
-        };
-        let current = match rest {
-            true => self.settings.read(cx).rest_port(),
-            false => self.settings.read(cx).ws_port(),
-        };
+    /// Applies the port field to settings once it loses focus. A valid new port rebinds
+    /// the listener; anything else snaps the field back to the running port.
+    fn flush_port(&mut self, cx: &mut Context<Self>) {
+        let input = self.port_remote.clone();
+        let current = self.settings.read(cx).remote_port();
         match valid_port(input.read(cx).text()) {
-            Some(port) if port != current => self.settings.update(cx, |settings, cx| match rest {
-                true => settings.set_rest_port(port, cx),
-                false => settings.set_ws_port(port, cx),
-            }),
+            Some(port) if port != current => self
+                .settings
+                .update(cx, |settings, cx| settings.set_remote_port(port, cx)),
             Some(_) => {}
             None => input.update(cx, |input, cx| input.set_text(current.to_string(), cx)),
         }
@@ -4591,15 +4615,11 @@ fn open_path(path: &Path) -> std::io::Result<()> {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The port fields flush on focus loss, so typing never rebinds a listener
-        // mid-number. The subscriptions live with the view once made.
+        // The port field flushes on focus loss, so typing never rebinds the listener
+        // mid-number. The subscription lives with the view once made.
         if self.port_blur.is_none() {
-            let rest = self.port_rest.read(cx).focus_handle(cx);
-            let ws = self.port_ws.read(cx).focus_handle(cx);
-            self.port_blur = Some([
-                cx.on_blur(&rest, window, |this, _, cx| this.flush_port(true, cx)),
-                cx.on_blur(&ws, window, |this, _, cx| this.flush_port(false, cx)),
-            ]);
+            let port = self.port_remote.read(cx).focus_handle(cx);
+            self.port_blur = Some(cx.on_blur(&port, window, |this, _, cx| this.flush_port(cx)));
         }
         let searching = self.searching();
         // a search can list the typeface row from any category
@@ -4970,9 +4990,27 @@ fn valid_port(text: &str) -> Option<u16> {
     text.parse::<u16>().ok().filter(|port| *port != 0)
 }
 
+/// The two addresses remote control answers on: plain HTTP and the WebSocket upgrade
+/// path, on the same listener.
+fn remote_urls(addr: &SocketAddr) -> String {
+    format!("http://{addr} + ws://{addr}/v1/ws")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::valid_port;
+    use super::{SocketAddr, remote_urls, valid_port};
+
+    #[test]
+    fn remote_urls_name_both_protocols() {
+        let addr: SocketAddr = "127.0.0.1:47630"
+            .parse()
+            .expect("a loopback address parses");
+
+        assert_eq!(
+            remote_urls(&addr),
+            "http://127.0.0.1:47630 + ws://127.0.0.1:47630/v1/ws"
+        );
+    }
 
     #[test]
     fn port_fields_take_1_to_65535() {

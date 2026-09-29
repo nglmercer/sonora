@@ -24,6 +24,9 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 pub struct PluginContext {
     pub client: Client,
     pub auth: Auth,
+    /// Whether this serve requires the session token. False leaves the loopback listener
+    /// open to any local client; the user opted out knowing that.
+    pub auth_required: bool,
 }
 
 /// A built-in control transport. The manager owns the compile-time registry; there is no
@@ -52,6 +55,8 @@ pub struct Registration {
     pub enabled: fn(&AppSettings) -> bool,
     /// The loopback port this plugin binds. Zero asks the OS for one.
     pub port: fn(&AppSettings) -> u16,
+    /// Whether this plugin requires the session token.
+    pub auth_required: fn(&AppSettings) -> bool,
 }
 
 /// The listener state of one plugin, for settings.
@@ -96,6 +101,7 @@ struct Slot {
     plugin: Arc<dyn Plugin>,
     enabled: fn(&AppSettings) -> bool,
     port: fn(&AppSettings) -> u16,
+    auth_required: fn(&AppSettings) -> bool,
     state: SlotState,
 }
 
@@ -108,6 +114,8 @@ enum SlotState {
         /// The configured port this listener bound for. Compared against settings, so a
         /// zero asking the OS for a port does not read as drift on every reconcile.
         port: u16,
+        /// Whether this serve requires the session token. A settings flip rebinds.
+        auth_required: bool,
     },
     Failed {
         reason: String,
@@ -145,6 +153,7 @@ impl Plugins {
                     plugin: registration.plugin,
                     enabled: registration.enabled,
                     port: registration.port,
+                    auth_required: registration.auth_required,
                     state: SlotState::Stopped,
                 })
                 .collect(),
@@ -176,17 +185,24 @@ impl Plugins {
     /// leaves everything untouched when the OS would not hand out randomness.
     pub fn rotate_token(&mut self, cx: &mut Context<Self>) -> Option<String> {
         let token = self.auth.rotate()?;
-        let ports: Vec<u16> = {
+        let targets: Vec<(u16, bool)> = {
             let settings = self.settings.read(cx);
             self.slots
                 .iter()
-                .map(|slot| (slot.port)(settings))
+                .map(|slot| ((slot.port)(settings), (slot.auth_required)(settings)))
                 .collect()
         };
-        for (slot, port) in self.slots.iter_mut().zip(ports) {
+        for (slot, (port, auth_required)) in self.slots.iter_mut().zip(targets) {
             if matches!(slot.state, SlotState::Running { .. }) {
                 stop(&self.io, slot);
-                start(&self.io, &self.client, &self.auth, slot, port);
+                start(
+                    &self.io,
+                    &self.client,
+                    &self.auth,
+                    slot,
+                    port,
+                    auth_required,
+                );
             }
         }
         cx.notify();
@@ -196,24 +212,50 @@ impl Plugins {
     /// Starts, stops or retries plugins to match the enable flags. Bind failures park one
     /// plugin as failed; everything else keeps running.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
-        let wanted: Vec<(bool, u16)> = {
+        let wanted: Vec<(bool, u16, bool)> = {
             let settings = self.settings.read(cx);
             self.slots
                 .iter()
-                .map(|slot| ((slot.enabled)(settings), (slot.port)(settings)))
+                .map(|slot| {
+                    (
+                        (slot.enabled)(settings),
+                        (slot.port)(settings),
+                        (slot.auth_required)(settings),
+                    )
+                })
                 .collect()
         };
-        for (slot, (enabled, port)) in self.slots.iter_mut().zip(wanted) {
+        for (slot, (enabled, port, auth_required)) in self.slots.iter_mut().zip(wanted) {
             let running = match &slot.state {
-                SlotState::Running { port, .. } => Some(*port),
+                SlotState::Running {
+                    port,
+                    auth_required,
+                    ..
+                } => Some((*port, *auth_required)),
                 SlotState::Stopped | SlotState::Failed { .. } => None,
             };
             match (enabled, running) {
-                (true, Some(current)) if current != port => {
+                (true, Some((current_port, current_auth)))
+                    if current_port != port || current_auth != auth_required =>
+                {
                     stop(&self.io, slot);
-                    start(&self.io, &self.client, &self.auth, slot, port);
+                    start(
+                        &self.io,
+                        &self.client,
+                        &self.auth,
+                        slot,
+                        port,
+                        auth_required,
+                    );
                 }
-                (true, None) => start(&self.io, &self.client, &self.auth, slot, port),
+                (true, None) => start(
+                    &self.io,
+                    &self.client,
+                    &self.auth,
+                    slot,
+                    port,
+                    auth_required,
+                ),
                 (false, Some(_)) => stop(&self.io, slot),
                 _ => {}
             }
@@ -243,7 +285,7 @@ impl Drop for Plugins {
 }
 
 /// Binds loopback and serves it on the io runtime. A bind failure parks the slot as failed.
-fn start(io: &Io, client: &Client, auth: &Auth, slot: &mut Slot, port: u16) {
+fn start(io: &Io, client: &Client, auth: &Auth, slot: &mut Slot, port: u16, auth_required: bool) {
     let socket = SocketAddr::new(LOOPBACK, port);
     let std_listener = match std::net::TcpListener::bind(socket) {
         Ok(listener) => listener,
@@ -300,6 +342,7 @@ fn start(io: &Io, client: &Client, auth: &Auth, slot: &mut Slot, port: u16) {
     let ctx = PluginContext {
         client: client.clone(),
         auth: auth.clone(),
+        auth_required,
     };
     let task = io.spawn(async move { plugin.serve(ctx, listener, rx).await });
     log::info!("plugins: {} listening on {addr}", slot.plugin.id());
@@ -308,6 +351,7 @@ fn start(io: &Io, client: &Client, auth: &Auth, slot: &mut Slot, port: u16) {
         task,
         addr,
         port,
+        auth_required,
     };
 }
 
@@ -350,6 +394,7 @@ mod tests {
         id: &'static str,
         served: AtomicUsize,
         stopped: AtomicUsize,
+        open: AtomicUsize,
     }
 
     impl Fake {
@@ -358,6 +403,7 @@ mod tests {
                 id,
                 served: AtomicUsize::new(0),
                 stopped: AtomicUsize::new(0),
+                open: AtomicUsize::new(0),
             })
         }
     }
@@ -370,11 +416,14 @@ mod tests {
 
         async fn serve(
             &self,
-            _ctx: PluginContext,
+            ctx: PluginContext,
             listener: tokio::net::TcpListener,
             mut shutdown: oneshot::Receiver<()>,
         ) {
             self.served.fetch_add(1, Ordering::Relaxed);
+            if !ctx.auth_required {
+                self.open.fetch_add(1, Ordering::Relaxed);
+            }
             loop {
                 tokio::select! {
                     _ = &mut shutdown => break,
@@ -429,8 +478,7 @@ mod tests {
     struct Rig {
         settings: Entity<AppSettings>,
         plugins: Entity<Plugins>,
-        rest: Arc<Fake>,
-        ws: Arc<Fake>,
+        remote: Arc<Fake>,
         root: PathBuf,
     }
 
@@ -450,42 +498,34 @@ mod tests {
             let io = Io::new().expect("io runtime starts");
             let settings = cx.new(|_| AppSettings::load_at(root.join("settings.json"), database));
             let (_, client) = control::channel::pair(pictured());
-            let rest = Fake::new("rest");
-            let ws = Fake::new("ws");
+            let remote = Fake::new("remote");
             let plugins = cx.new(|cx| {
                 Plugins::new(
                     io,
                     settings.clone(),
                     client,
-                    vec![
-                        Registration {
-                            plugin: rest.clone(),
-                            enabled: AppSettings::rest_api,
-                            port: AppSettings::rest_port,
-                        },
-                        Registration {
-                            plugin: ws.clone(),
-                            enabled: AppSettings::ws_api,
-                            port: AppSettings::ws_port,
-                        },
-                    ],
+                    vec![Registration {
+                        plugin: remote.clone(),
+                        enabled: AppSettings::remote_api,
+                        port: AppSettings::remote_port,
+                        auth_required: AppSettings::remote_auth,
+                    }],
                     cx,
                 )
             });
             Self {
                 settings,
                 plugins,
-                rest,
-                ws,
+                remote,
                 root,
             }
         }
 
-        fn enable_rest(&self, cx: &mut gpui::TestAppContext) {
+        fn enable_remote(&self, cx: &mut gpui::TestAppContext) {
             cx.update(|cx| {
                 self.settings.update(cx, |settings, cx| {
-                    settings.set_rest_port(0, cx);
-                    settings.set_rest_api(true, cx);
+                    settings.set_remote_port(0, cx);
+                    settings.set_remote_api(true, cx);
                 });
             });
             cx.run_until_parked();
@@ -535,12 +575,11 @@ mod tests {
         let rig = Rig::new(cx);
 
         assert!(matches!(
-            rig.status("rest", cx),
+            rig.status("remote", cx),
             Some(PluginStatus::Stopped)
         ));
-        assert!(matches!(rig.status("ws", cx), Some(PluginStatus::Stopped)));
         assert!(rig.status("other", cx).is_none());
-        assert_eq!(rig.rest.served.load(Ordering::Relaxed), 0);
+        assert_eq!(rig.remote.served.load(Ordering::Relaxed), 0);
         let token = cx.update(|cx| rig.plugins.read(cx).token());
         assert_eq!(token, None);
     }
@@ -548,84 +587,106 @@ mod tests {
     #[gpui::test]
     async fn enable_starts_listening_on_loopback(cx: &mut gpui::TestAppContext) {
         let rig = Rig::new(cx);
-        rig.enable_rest(cx);
+        rig.enable_remote(cx);
 
-        let addr = rig.addr("rest", cx);
+        let addr = rig.addr("remote", cx);
         assert!(addr.ip().is_loopback());
         assert_ne!(addr.port(), 0);
-        Rig::await_served(&rig.rest, 1);
+        Rig::await_served(&rig.remote, 1);
         let token = cx.update(|cx| rig.plugins.read(cx).token());
         assert_eq!(token.as_deref().map(str::len), Some(43));
 
         TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("the port is open");
-        assert!(matches!(rig.status("ws", cx), Some(PluginStatus::Stopped)));
     }
 
     #[gpui::test]
     async fn disable_stops_and_frees_the_port(cx: &mut gpui::TestAppContext) {
         let rig = Rig::new(cx);
-        rig.enable_rest(cx);
-        let addr = rig.addr("rest", cx);
+        rig.enable_remote(cx);
+        let addr = rig.addr("remote", cx);
 
         cx.update(|cx| {
             rig.settings.update(cx, |settings, cx| {
-                settings.set_rest_api(false, cx);
+                settings.set_remote_api(false, cx);
             });
         });
         cx.run_until_parked();
 
         assert!(matches!(
-            rig.status("rest", cx),
+            rig.status("remote", cx),
             Some(PluginStatus::Stopped)
         ));
-        Rig::await_stopped(&rig.rest, 1);
+        Rig::await_stopped(&rig.remote, 1);
         assert!(TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_err());
     }
 
     #[gpui::test]
     async fn port_change_rebinds(cx: &mut gpui::TestAppContext) {
         let rig = Rig::new(cx);
-        rig.enable_rest(cx);
-        Rig::await_served(&rig.rest, 1);
+        rig.enable_remote(cx);
+        Rig::await_served(&rig.remote, 1);
         let token = cx.update(|cx| rig.plugins.read(cx).token());
 
         // A reconcile with the same port leaves the listener alone.
         cx.update(|cx| {
             rig.settings.update(cx, |settings, cx| {
-                settings.set_rest_port(0, cx);
+                settings.set_remote_port(0, cx);
             });
         });
         cx.run_until_parked();
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(rig.rest.served.load(Ordering::Relaxed), 1);
+        assert_eq!(rig.remote.served.load(Ordering::Relaxed), 1);
 
         let held = std::net::TcpListener::bind(SocketAddr::new(LOOPBACK, 0)).expect("a free port");
         let port = held.local_addr().expect("a bound port").port();
         drop(held);
         cx.update(|cx| {
             rig.settings.update(cx, |settings, cx| {
-                settings.set_rest_port(port, cx);
+                settings.set_remote_port(port, cx);
             });
         });
         cx.run_until_parked();
 
-        Rig::await_served(&rig.rest, 2);
-        Rig::await_stopped(&rig.rest, 1);
-        assert_eq!(rig.rest.served.load(Ordering::Relaxed), 2);
-        assert_eq!(rig.addr("rest", cx).port(), port);
+        Rig::await_served(&rig.remote, 2);
+        Rig::await_stopped(&rig.remote, 1);
+        assert_eq!(rig.remote.served.load(Ordering::Relaxed), 2);
+        assert_eq!(rig.addr("remote", cx).port(), port);
         assert_eq!(cx.update(|cx| rig.plugins.read(cx).token()), token);
+    }
+
+    #[gpui::test]
+    async fn auth_change_restarts_open(cx: &mut gpui::TestAppContext) {
+        let rig = Rig::new(cx);
+        rig.enable_remote(cx);
+        Rig::await_served(&rig.remote, 1);
+        assert_eq!(rig.remote.open.load(Ordering::Relaxed), 0);
+
+        cx.update(|cx| {
+            rig.settings.update(cx, |settings, cx| {
+                settings.set_remote_auth(false, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        Rig::await_served(&rig.remote, 2);
+        Rig::await_stopped(&rig.remote, 1);
+        assert_eq!(rig.remote.open.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            rig.status("remote", cx),
+            Some(PluginStatus::Running { .. })
+        ));
     }
 
     #[gpui::test]
     async fn disable_forgets_the_token(cx: &mut gpui::TestAppContext) {
         let rig = Rig::new(cx);
-        rig.enable_rest(cx);
+        rig.enable_remote(cx);
         let before = cx.update(|cx| rig.plugins.read(cx).token());
         assert!(before.is_some());
 
         cx.update(|cx| {
             rig.settings.update(cx, |settings, cx| {
-                settings.set_rest_api(false, cx);
+                settings.set_remote_api(false, cx);
             });
         });
         cx.run_until_parked();
@@ -633,7 +694,7 @@ mod tests {
 
         cx.update(|cx| {
             rig.settings.update(cx, |settings, cx| {
-                settings.set_rest_api(true, cx);
+                settings.set_remote_api(true, cx);
             });
         });
         cx.run_until_parked();
@@ -651,21 +712,29 @@ mod tests {
 
         cx.update(|cx| {
             rig.settings.update(cx, |settings, cx| {
-                settings.set_rest_port(port, cx);
-                settings.set_rest_api(true, cx);
-                settings.set_ws_port(0, cx);
-                settings.set_ws_api(true, cx);
+                settings.set_remote_port(port, cx);
+                settings.set_remote_api(true, cx);
             });
         });
         cx.run_until_parked();
 
-        match rig.status("rest", cx) {
+        match rig.status("remote", cx) {
             Some(PluginStatus::Failed { reason }) => assert!(!reason.is_empty()),
-            status => panic!("expected rest failed, saw {status:?}"),
+            status => panic!("expected remote failed, saw {status:?}"),
         }
-        assert_eq!(rig.rest.served.load(Ordering::Relaxed), 0);
+        assert_eq!(rig.remote.served.load(Ordering::Relaxed), 0);
+
+        // Asking the OS for a port retries the bind.
+        cx.update(|cx| {
+            rig.settings.update(cx, |settings, cx| {
+                settings.set_remote_port(0, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        Rig::await_served(&rig.remote, 1);
         assert!(matches!(
-            rig.status("ws", cx),
+            rig.status("remote", cx),
             Some(PluginStatus::Running { .. })
         ));
     }
@@ -673,17 +742,17 @@ mod tests {
     #[gpui::test]
     async fn double_enable_starts_once(cx: &mut gpui::TestAppContext) {
         let rig = Rig::new(cx);
-        rig.enable_rest(cx);
+        rig.enable_remote(cx);
         cx.update(|cx| {
             rig.settings.update(cx, |settings, cx| {
-                settings.set_rest_api(true, cx);
+                settings.set_remote_api(true, cx);
             });
         });
         cx.run_until_parked();
 
-        Rig::await_served(&rig.rest, 1);
+        Rig::await_served(&rig.remote, 1);
         assert!(matches!(
-            rig.status("rest", cx),
+            rig.status("remote", cx),
             Some(PluginStatus::Running { .. })
         ));
     }
@@ -691,7 +760,7 @@ mod tests {
     #[gpui::test]
     async fn rotate_restarts_and_changes_the_token(cx: &mut gpui::TestAppContext) {
         let rig = Rig::new(cx);
-        rig.enable_rest(cx);
+        rig.enable_remote(cx);
         let before = cx.update(|cx| rig.plugins.read(cx).token());
 
         let after = cx.update(|cx| {
@@ -702,27 +771,37 @@ mod tests {
         assert!(before.is_some());
         assert!(after.is_some());
         assert_ne!(before, after);
-        Rig::await_served(&rig.rest, 2);
-        Rig::await_stopped(&rig.rest, 1);
+        Rig::await_served(&rig.remote, 2);
+        Rig::await_stopped(&rig.remote, 1);
         assert!(matches!(
-            rig.status("rest", cx),
+            rig.status("remote", cx),
             Some(PluginStatus::Running { .. })
         ));
-        assert_eq!(rig.ws.served.load(Ordering::Relaxed), 0);
     }
 
     #[gpui::test]
     async fn saved_enablement_listens_on_startup(cx: &mut gpui::TestAppContext) {
-        let rig = Rig::with_settings(cx, Some(r#"{"rest_api":true,"rest_port":0}"#));
+        let rig = Rig::with_settings(cx, Some(r#"{"remote_api":true,"remote_port":0}"#));
 
         assert!(matches!(
-            rig.status("rest", cx),
+            rig.status("remote", cx),
             Some(PluginStatus::Running { .. })
         ));
         cx.update(|cx| {
             rig.settings.update(cx, |_, cx| cx.emit(Reloaded));
         });
         cx.run_until_parked();
-        Rig::await_served(&rig.rest, 1);
+        Rig::await_served(&rig.remote, 1);
+    }
+
+    #[gpui::test]
+    async fn retired_flags_listen_on_startup(cx: &mut gpui::TestAppContext) {
+        let rig = Rig::with_settings(cx, Some(r#"{"ws_api":true,"ws_port":0}"#));
+
+        Rig::await_served(&rig.remote, 1);
+        assert!(matches!(
+            rig.status("remote", cx),
+            Some(PluginStatus::Running { .. })
+        ));
     }
 }

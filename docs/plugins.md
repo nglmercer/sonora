@@ -5,13 +5,15 @@ WebSocket. Both transports speak the same typed schema, defined in
 `crates/control`: the same commands, snapshots and events, only framed
 differently.
 
-Nothing listens until you turn it on. Both transports are off by default, bind
-to loopback (`127.0.0.1`) only, and require a bearer token on every call,
-reads included. Turn them on in Settings > Integrations > Remote control,
-where each row shows whether its listener is up and where. The token lives
-only in memory: quitting Sonora forgets it, turning both transports off
-forgets it, and rotating it drops every open connection. The next enable
-mints a fresh one.
+Nothing listens until you turn it on. The server is off by default and binds
+to loopback (`127.0.0.1`) only, serving both HTTP and WebSocket on one port.
+Turn it on in Settings > Integrations > Remote control, where the switch
+shows whether the listener is up and where, and a second switch selects
+token-checked or open. Token mode requires a bearer token on every call,
+reads included; open mode skips every check for clients that cannot send
+headers. The token lives only in memory: quitting Sonora forgets it, turning
+remote control off forgets it, and rotating it drops every open connection.
+The next enable mints a fresh one.
 
 ## Concepts
 
@@ -34,7 +36,7 @@ results.
 
 ## REST
 
-Default port `47630`, configurable per row. Requests are capped at 64 KiB.
+Default port `47630`, configurable in settings. Requests are capped at 64 KiB.
 
 | Method | Path           | Body                       | Reply              |
 | ------ | -------------- | -------------------------- | ------------------ |
@@ -43,9 +45,10 @@ Default port `47630`, configurable per row. Requests are capped at 64 KiB.
 | GET    | `/v1/queue`    | —                          | `queue` section    |
 | POST   | `/v1/commands` | one `Command` as JSON      | `{"v":1,"accepted":true,"snapshot_revision":N}` |
 
-Every request needs `Authorization: Bearer <token>` and, for commands,
-`Content-Type: application/json`. Missing or wrong credentials answer 401
-with a `Bearer` challenge. Unknown paths answer `not_found`.
+In token mode, every request needs `Authorization: Bearer <token>` and, for
+commands, `Content-Type: application/json`. Missing or wrong credentials
+answer 401 with a `Bearer` challenge. Unknown paths answer `not_found`.
+Open mode answers everything without credentials.
 
 A command body names the command in `command` with its arguments beside it:
 
@@ -72,12 +75,13 @@ curl -H "Authorization: Bearer $SONORA_TOKEN" -H 'Content-Type: application/json
 
 ## WebSocket
 
-Default port `47631`, path `/v1/ws`, for native clients. The upgrade request
-needs `Authorization: Bearer <token>`; any request carrying an `Origin`
-header is refused, so browser pages cannot connect. Messages are text frames
-capped at 64 KiB. One listener serves at most 8 clients; further upgrades
-are refused until one disconnects. Idle connections are pinged every 30
-seconds, and a dead one is dropped on the first failed send.
+Same port as REST, path `/v1/ws`, for native clients. In token mode the upgrade
+request needs `Authorization: Bearer <token>`, and any request carrying an
+`Origin` header is refused, so browser pages cannot connect. Open mode
+upgrades anything, origins included. Messages are text frames capped at 64
+KiB. One listener serves at most 8 clients; further upgrades are refused
+until one disconnects. Idle connections are pinged every 30 seconds, and a
+dead one is dropped on the first failed send.
 
 The server opens with the full snapshot:
 
@@ -112,11 +116,14 @@ fresh snapshot to continue from; anything unparsable gets an id-less
 
 ## Security model
 
-- Off by default, loopback only, bearer token on reads and writes.
+- Off by default, loopback only, bearer token on reads and writes in token mode.
+- Open mode skips every check: any local process can drive playback, and over
+  WebSocket any website you visit can too. Prefer token mode; the settings
+  warning says when remote control is open.
 - The token is 32 random bytes, base64-encoded, kept in memory, never
-  written to `settings.json` or the log. Rotation restarts running listeners
-  so old connections drop; disabling a transport closes its port.
-- No CORS headers are served and the WebSocket refuses browser origins, so a
+  written to `settings.json` or the log. Rotation restarts the listener
+  so old connections drop; disabling remote control closes its port.
+- No CORS headers are served and token mode refuses browser origins, so a
   web page cannot drive or read the player, even with a leaked token.
 - Responses carry no file paths, credentials, provider errors or account
   details: local ids are withheld, failures name no reason, and nothing is
@@ -129,8 +136,8 @@ fresh snapshot to continue from; anything unparsable gets an id-less
 - The APIs drive playback and the queue only. There is no enqueue-by-ID,
   no library or account administration, no settings access and no audio
   streaming; local tracks expose no path-bearing IDs at all.
-- Listeners bind loopback only, with no LAN mode, discovery or port
-  forwarding. Browser clients are refused on both transports.
-- The token is ephemeral: it changes on restart and whenever both
-  transports have been off. Clients should ask the user to re-copy it
+- The listener binds loopback only, with no LAN mode, discovery or port
+  forwarding. Browser clients are refused in token mode.
+- The token is ephemeral: it changes on restart and whenever remote
+  control has been off. Clients should ask the user to re-copy it
   after a 401, the way they would re-pair any remote.

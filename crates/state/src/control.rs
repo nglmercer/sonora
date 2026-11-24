@@ -411,8 +411,19 @@ impl Control {
             this.update(cx, |this, cx| {
                 let answer = match fetched {
                     Ok(Ok(batches)) => {
-                        this.place(batches, placement, cx);
-                        Reply::Done
+                        // Playback may have moved to another device while the fetch ran. A
+                        // positioned queue is the one thing we cannot honour there, and the
+                        // append `place` would make is not what was asked for.
+                        let steered = matches!(
+                            placement,
+                            Place::Queue(QueuePlacement::Next | QueuePlacement::Gap(_))
+                        ) && this.playback.read(cx).steered(cx).is_some();
+                        if steered {
+                            Reply::Failed(Failure::SteeredReadOnly)
+                        } else {
+                            this.place(batches, placement, cx);
+                            Reply::Done
+                        }
                     }
                     Ok(Err(missed)) => {
                         if let Some(error) = &missed.error {
